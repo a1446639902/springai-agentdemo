@@ -3,6 +3,7 @@ package io.github.javaside.springai.codetui.agent.tools;
 import org.springframework.ai.chat.model.ToolContext;
 import org.springframework.ai.tool.ToolCallback;
 import org.springframework.ai.tool.definition.ToolDefinition;
+import org.springframework.ai.tool.execution.ToolExecutionException;
 
 import java.time.Duration;
 import java.util.concurrent.ExecutionException;
@@ -57,18 +58,36 @@ public final class TimeLimitedToolCallback implements ToolCallback {
             return future.get(timeout.toMillis(), TimeUnit.MILLISECONDS);
         } catch (TimeoutException e) {
             future.cancel(true);
-            throw new IllegalStateException(
+            throw toolFailure(delegate.getToolDefinition(),
                     name + " 超时（超过 " + timeout.toSeconds() + " 秒未返回）", e);
         } catch (InterruptedException e) {
             future.cancel(true);
             Thread.currentThread().interrupt();
-            throw new IllegalStateException(name + " 被中断", e);
+            throw toolFailure(delegate.getToolDefinition(), name + " 被中断", e);
         } catch (ExecutionException e) {
             Throwable cause = e.getCause();
             if (cause instanceof RuntimeException runtime) {
                 throw runtime;      // 委托自己的异常原样传播，不改语义、不丢定位信息
             }
-            throw new IllegalStateException(name + " 执行失败：" + cause, cause);
+            throw toolFailure(delegate.getToolDefinition(),
+                    name + " 执行失败：" + cause, cause);
         }
+    }
+
+    /**
+     * 包装为本装饰器自身失败（超时/中断/不可传播的受检异常）的异常类型。
+     *
+     * <p><b>必须是 {@link ToolExecutionException} 而非 IllegalStateException</b>（2026-09-06 生产事故
+     * 回合 10 的教训）：Spring AI {@code DefaultToolCallingManager.executeToolCall} 只 catch
+     * ToolExecutionException 交给 {@code ResilientToolExecutionExceptionProcessor} 转错误文本回模型；
+     * IllegalStateException 会穿透它（以及只接「No ToolCallback found」的
+     * {@code ResilientToolCallingManager}）一路杀到 CodingAgent，把整回合标失败——一次工具超时
+     * 就报废整个回合。ToolExecutionException 构造取 cause 的 message，故可读文案放进 cause 再包；
+     * ToolDefinition 必须携带真实定义（processor 靠它点名是哪个工具出错）。
+     */
+    private static ToolExecutionException toolFailure(ToolDefinition definition,
+            String message, Throwable cause) {
+        return new ToolExecutionException(definition,
+                new IllegalStateException(message, cause));
     }
 }
