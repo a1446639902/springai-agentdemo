@@ -1,5 +1,10 @@
 package io.github.javaside.springai.codetui.agent.llm;
 
+import com.openai.errors.BadRequestException;
+import com.openai.errors.InternalServerException;
+import com.openai.errors.RateLimitException;
+import com.openai.errors.UnauthorizedException;
+import com.openai.errors.UnexpectedStatusCodeException;
 import org.junit.jupiter.api.Test;
 import org.springframework.web.reactive.function.client.WebClientResponseException;
 
@@ -65,6 +70,15 @@ class RetryPolicyTest {
         // 429 限流（Task 2 补）：WCRE 状态 429——「请求没病、服务端在节流」的唯一可重试 4xx
         // （spec §5 L1 行「零下发 429 → 重试成功」点名；文案含 rate limit 的旧口径不变）
         cases.add(WebClientResponseException.create(429, "Too Many Requests", null, null, null));
+        // SDK 系 5xx（2026-09-06 生产事故补）：智谱网关 503 抛 InternalServerException——
+        // 非 IOException、非 WCRE、message 无关键词，旧判据全落空直接杀回合（实测 60 次）。
+        // CompletionException 包装按真实传播形态（CompletableFuture 链异步路径）。
+        cases.add(new java.util.concurrent.CompletionException(
+                sdkServerException(503)));
+        // SDK 系 429：RateLimitException——与 WCRE 429 同语义（状态码类内固定，Builder 无 statusCode）
+        cases.add(new java.util.concurrent.CompletionException(
+                RateLimitException.builder()
+                        .headers(com.openai.core.http.Headers.builder().build()).build()));
         return cases;
     }
 
@@ -87,7 +101,27 @@ class RetryPolicyTest {
         // retryWhen 命中 L2 白名单（spec §3.2 类型穿透）；cause 是瞬态也不得因此被重试
         cases.add(new StreamInterruptedException(2,
                 new RuntimeException(new java.io.EOFException("EOF reached while reading"))));
+        // SDK 系 4xx 红线：与 WCRE 4xx 同口径（请求本身有病/欠费，重试只会更慢更花钱）。
+        // CompletionException 包装按真实传播形态；状态码类内固定（401/400），Builder 无 statusCode。
+        cases.add(new java.util.concurrent.CompletionException(
+                UnauthorizedException.builder()
+                        .headers(com.openai.core.http.Headers.builder().build()).build()));
+        cases.add(new java.util.concurrent.CompletionException(
+                BadRequestException.builder()
+                        .headers(com.openai.core.http.Headers.builder().build()).build()));
+        // SDK 系非 5xx 非标准 4xx（如网关回 3xx/418）：既非瞬态也非红线确定态 → 否决（同 WCRE 口径）
+        cases.add(new java.util.concurrent.CompletionException(
+                UnexpectedStatusCodeException.builder().statusCode(418)
+                        .headers(com.openai.core.http.Headers.builder().build()).build()));
         return cases;
+    }
+
+    /** 构造 SDK 5xx 异常（500..599 全区间映射 InternalServerException，503 为生产实例）。 */
+    private static InternalServerException sdkServerException(int statusCode) {
+        return InternalServerException.builder()
+                .statusCode(statusCode)
+                .headers(com.openai.core.http.Headers.builder().build())
+                .build();
     }
 
     /** 覆盖 RetryingChatModel.shouldRetry 的全部判据分支。 */
@@ -141,6 +175,30 @@ class RetryPolicyTest {
                 new RuntimeException("stream failed", new StreamIdleTimeoutException("等待模型流数据超时"))));
         assertTrue(RetryPolicy.shouldRetry(
                 new RuntimeException("stream failed", new EmptyStreamException("空流"))));
+    }
+
+    // ---- SDK 系（OpenAIServiceException）5xx/429 判据（2026-09-06 生产事故补）----
+
+    /** 生产实例精确复现：智谱网关 503 → InternalServerException，CompletionException 包装。 */
+    @Test
+    void shouldRetrySdk503ProductionShape() {
+        assertTrue(RetryPolicy.shouldRetry(new java.util.concurrent.CompletionException(
+                sdkServerException(503))), "503 必须瞬态重试（生产事故：60 次直接杀回合）");
+    }
+
+    /** 5xx 区间边界：500 与 599 都命中（SDK 把整个 500..599 映射为 InternalServerException）。 */
+    @Test
+    void shouldRetrySdk5xxRangeBounds() {
+        assertTrue(RetryPolicy.shouldRetry(sdkServerException(500)));
+        assertTrue(RetryPolicy.shouldRetry(sdkServerException(599)));
+    }
+
+    /** 取消红线优先于 SDK 5xx：链上有取消（Esc 回合取消伴生）即使混着 503 也不重试。 */
+    @Test
+    void cancellationShortCircuitsBeforeSdk5xx() {
+        RuntimeException cancelled = new RuntimeException("outer", new CancellationException());
+        cancelled.getCause().initCause(sdkServerException(503));
+        assertFalse(RetryPolicy.shouldRetry(cancelled), "取消优先短路，绝不重试");
     }
 
     // ---- 指数退避（attempt 为 1 基尝试序号：第 n 次尝试失败后的退避）----

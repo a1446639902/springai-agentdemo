@@ -1,5 +1,6 @@
 package io.github.javaside.springai.codetui.agent.llm;
 
+import com.openai.errors.OpenAIServiceException;
 import org.springframework.http.HttpStatus;
 import org.springframework.web.reactive.function.client.WebClientResponseException;
 
@@ -57,7 +58,10 @@ public final class RetryPolicy {
      *       或 {@link WebClientResponseException} 状态 429——429 虽是 4xx，但它是唯一的
      *       「请求没病、服务端在节流」4xx（Retry-After 语义），spec §5 L1 行「零下发 429 →
      *       重试成功」点名（Task 2 补，见该任务报告的偏差记录）；
-     *   <li>网关 5xx：cause 链上的 WebClientResponseException 且 is5xxServerError；
+     *   <li>网关 5xx：cause 链上的 WebClientResponseException 且 is5xxServerError，<b>或</b>
+     *       openai-java SDK 系的 {@link OpenAIServiceException} 且 statusCode≥500（智谱/Qwen 等
+     *       SDK 栈 provider 的 5xx face；2026-09-06 生产事故补——旧判据对 InternalServerException
+     *       全落空，网关 503 直接杀回合）；
      *   <li>流式专属：{@link StreamIdleTimeoutException}（空闲超时）与 {@link EmptyStreamException}
      *       （空流）——网关坏窗口在流式路径上的两副面孔。
      * </ul>
@@ -91,6 +95,20 @@ public final class RetryPolicy {
                     // 2xx 不在此列——「200 OK 但 body 坏」正是网关坏窗口的形态，交给 EOF/解析特征判定。
                     return false;
                 }
+            }
+            // SDK 系（openai-java：智谱/Qwen/OpenAI/opencode-go 全走它，OkHttp 栈）的 HTTP 状态
+            // 异常——与 WCRE 分支镜像（2026-09-06 生产事故补：智谱网关 503 抛
+            // InternalServerException，非 IOException、非 WCRE、message 无关键词，旧判据全落空，
+            // 60 次直接杀回合）。SDK 把 500..599 全区间映射 InternalServerException（源码核对），
+            // 4xx 各有具名子类（400/401/403/404/422）或 UnexpectedStatusCodeException。
+            // OpenAIRetryableException 不在此列：SDK 内部 RetryingHttpClient 已带 2 次重试，不越权。
+            if (t instanceof OpenAIServiceException svc) {
+                int code = svc.statusCode();
+                if (code >= 500 || code == 429) {
+                    transientFailure = true;          // 网关 5xx / 限流：与 WCRE 同语义
+                } else if (code >= 400) {
+                    return false;                     // 其余 4xx：红线，同 WCRE 口径
+                }                                    // 3xx 等：落空（既非瞬态也非红线，最终否决）
             }
             String msg = t.getMessage();
             if (msg != null) {
